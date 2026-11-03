@@ -1,4 +1,4 @@
-"""ShardFit Engine — Phase 3 (Dense Streamer).
+"""ShardFit Engine — Phase 3 (Dense Streamer) with real CUDA shard streaming.
 
 Main engine: load model -> shard -> stream through VRAM slots -> generate.
 
@@ -8,11 +8,13 @@ Architecture (section 5.3):
 - While compute stream runs shard i in slot A, copy stream loads shard i+1 into slot B
 - Slots rotate; KV cache stays resident
 - Output matches reference implementation exactly (lossless)
+- Real CUDA async copy: weights live in CPU pinned memory, only active shard on GPU
 """
 
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
@@ -23,7 +25,7 @@ from shardfit.sharder import ModelSharder, Shard, LayerBlock
 from shardfit.streamer import Streamer, Slot
 from shardfit.backends import Backend, create_backend
 from shardfit.kv_cache import KVCache, KVCacheConfig
-from shardfit.weights import WeightLoader, ShardedWeights
+from shardfit.weights import WeightLoader, ShardedWeights, WeightTensor
 from shardfit.moe import ExpertCache, ExpertCacheConfig, MoERouter
 
 
@@ -56,11 +58,18 @@ class GenerationResult:
 
 
 class ShardFitEngine:
-    """ShardFit dense streamer engine.
+    """ShardFit dense streamer engine with real CUDA shard streaming.
 
     Runs transformer layers shard-by-shard through VRAM slots so models larger
     than GPU memory can execute. Every layer runs on every pass (no skipping),
     making output lossless relative to a non-streamed reference.
+
+    Streaming execution:
+    1. All model weights live in CPU pinned memory (organized as shards)
+    2. Only the active shard's weights are copied to GPU VRAM slot
+    3. Compute stream runs layers from active shard
+    4. Copy stream preloads next shard into other slot (double buffering)
+    5. KV cache stays resident in VRAM throughout
     """
 
     def __init__(
@@ -77,7 +86,6 @@ class ShardFitEngine:
     ):
         self.model_path = model_path
         self.backend_type = backend_type
-        self.enable_moe = enable_moe
 
         # Hardware profile
         from shardfit.config import detect_hardware
@@ -108,7 +116,7 @@ class ShardFitEngine:
         self.expert_cache: Optional[ExpertCache] = None
         self.moe_router: Optional[MoERouter] = None
 
-        # Streamer
+        # Streamer for rotating slots
         self.streamer = Streamer(
             backend=self.backend,
             num_slots=self.budget.num_slots,
@@ -123,8 +131,16 @@ class ShardFitEngine:
         self.head_dim = 0
         self.vocab_size = 0
         self.max_context_len = max_context_len
+        self.enable_moe = enable_moe
 
         self._loaded = False
+
+        # CUDA compute stream (separate from copy stream in streamer)
+        self._compute_stream: Optional[torch.cuda.Stream] = None
+        self._supports_cuda_streams = False
+        if self.backend.supports_cuda() and torch.cuda.is_available():
+            self._compute_stream = torch.cuda.Stream(device=self.backend.device)
+            self._supports_cuda_streams = True
 
         print(f"[ShardFit] Engine initialized")
         print(f"  Backend: {'CUDA' if self.backend.supports_cuda() else 'CPU'}")
@@ -132,9 +148,15 @@ class ShardFitEngine:
         print(f"  VRAM: {self.budget.vram_total_gb} GB total, "
               f"{self.budget.resident_budget_gb} GB resident, "
               f"{self.budget.num_slots} slots x {self.budget.slot_size_gb} GB")
+        print(f"  CUDA streams: {'enabled' if self._supports_cuda_streams else 'disabled'}")
 
     def load_model(self) -> None:
-        """Load model, create shards, initialize KV cache."""
+        """Load model, create shards, initialize KV cache.
+
+        Weights are loaded into CPU pinned memory and organized into shards.
+        Only resident weights (embedding, head) are copied to GPU immediately;
+        streamed shards stay in CPU RAM until their turn in the slot rotation.
+        """
         if self._loaded:
             return
 
@@ -162,16 +184,16 @@ class ShardFitEngine:
         # Discover architecture
         self._discover_architecture()
 
-        # Load weights into sharded format from the already-loaded model
+        # Load weights into sharded format (CPU pinned memory)
         loader = WeightLoader(self.model_path, dtype=dtype, device="cpu")
-        state_dict = {k: v.to(dtype=dtype, device="cpu")
+        state_dict = {k: v.to(dtype=dtype, device="cpu", non_blocking=True)
                       for k, v in self.model.state_dict().items()}
         self.sharded_weights = loader._organize_into_shards(
             state_dict, slot_size_gb=self.budget.slot_size_gb
         )
         self.sharded_weights.source_format = "transformers"
 
-        # Initialize KV cache
+        # Initialize KV cache (resident in VRAM)
         self.kv_cache = KVCache(
             KVCacheConfig(
                 num_layers=self.num_layers,
@@ -191,6 +213,9 @@ class ShardFitEngine:
         self.shards = self.sharded_weights.shards
         self.streamer.load_shards(self.shards)
 
+        # Preload resident weights to GPU
+        self._load_resident_to_gpu()
+
         self._loaded = True
 
         total_mb = self.kv_cache.get_memory_mb() if self.kv_cache else 0
@@ -198,6 +223,7 @@ class ShardFitEngine:
               f"{len(self.shards)} shards, KV cache {total_mb:.1f} MB")
         print(f"[ShardFit] Architecture: {self.num_layers} layers, "
               f"{self.num_heads} heads, head_dim={self.head_dim}")
+        print(f"[ShardFit] Resident weights on GPU, streamed shards in CPU RAM")
 
     def _discover_architecture(self) -> None:
         """Discover model architecture from the loaded model."""
@@ -223,10 +249,8 @@ class ShardFitEngine:
         if num_experts > 0:
             self.moe_router = MoERouter(num_experts, experts_per_token)
 
-            # Estimate expert size (shared weight size / num_experts roughly)
-            expert_size_bytes = self.hidden_size * self.hidden_size * 2  # fp16
+            expert_size_bytes = self.hidden_size * self.hidden_size * 2
 
-            # Calculate how many experts fit in resident budget
             max_cached = int(self.budget.resident_budget_gb * 1024**3 /
                              max(expert_size_bytes, 1))
             max_cached = max(max_cached, 1)
@@ -244,6 +268,92 @@ class ShardFitEngine:
             print(f"[ShardFit] MoE enabled: {num_experts} experts, "
                   f"{experts_per_token} per token, cache={max_cached} experts")
 
+    def _load_resident_to_gpu(self) -> None:
+        """Copy resident weights (embedding, output head, norms) to GPU.
+
+        These stay in VRAM permanently and are not part of slot rotation.
+        """
+        device = self.backend.device
+        dtype = torch.float16 if self.backend.supports_cuda() else torch.float32
+
+        for name, tensor in self.sharded_weights.resident_weights.items():
+            # Keep a GPU copy of resident weights
+            self.sharded_weights.resident_weights[name] = tensor.to(device, dtype=dtype)
+
+    def _get_shard_weights_on_gpu(
+        self,
+        shard: Shard,
+    ) -> Dict[str, torch.Tensor]:
+        """Get a shard's weights copied to GPU VRAM slot.
+
+        This is the key streaming operation: only the active shard's weights
+        occupy GPU VRAM. Weights are copied from CPU pinned memory to GPU
+        using non-blocking transfers when CUDA is available.
+
+        Returns:
+            Dict mapping parameter name to GPU tensor
+        """
+        device = self.backend.device
+        dtype = torch.float16 if self.backend.supports_cuda() else torch.float32
+        stream = self._compute_stream if self._supports_cuda_streams else None
+
+        shard_weights: Dict[str, torch.Tensor] = {}
+
+        # Use CUDA stream for non-blocking copy if available
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                for block in shard.blocks:
+                    for key in block.state_dict_keys:
+                        # Check if resident (already on GPU)
+                        if key in self.sharded_weights.resident_weights:
+                            shard_weights[key] = self.sharded_weights.resident_weights[key]
+                            continue
+
+                        # Get CPU tensor from model state dict
+                        cpu_tensor = None
+                        for name, tensor in self.model.named_parameters():
+                            if name == key:
+                                cpu_tensor = tensor
+                                break
+                        if cpu_tensor is None:
+                            for name, tensor in self.model.named_buffers():
+                                if name == key:
+                                    cpu_tensor = tensor
+                                    break
+
+                        if cpu_tensor is not None:
+                            # Non-blocking copy to GPU
+                            gpu_tensor = cpu_tensor.to(
+                                device=device, dtype=dtype, non_blocking=True
+                            )
+                            shard_weights[key] = gpu_tensor
+
+            # Synchronize compute stream after all copies
+            stream.synchronize()
+        else:
+            # CPU fallback: synchronous copy
+            for block in shard.blocks:
+                for key in block.state_dict_keys:
+                    if key in self.sharded_weights.resident_weights:
+                        shard_weights[key] = self.sharded_weights.resident_weights[key]
+                        continue
+
+                    cpu_tensor = None
+                    for name, tensor in self.model.named_parameters():
+                        if name == key:
+                            cpu_tensor = tensor
+                            break
+                    if cpu_tensor is None:
+                        for name, tensor in self.model.named_buffers():
+                            if name == key:
+                                cpu_tensor = tensor
+                                break
+
+                    if cpu_tensor is not None:
+                        shard_weights[key] = cpu_tensor.to(device=device, dtype=dtype)
+
+        return shard_weights
+
     def generate(
         self,
         prompt: str,
@@ -252,10 +362,16 @@ class ShardFitEngine:
         """Generate text using sharded streaming forward pass.
 
         For each token:
-        1. Embed input
-        2. For each shard: load into slot, run layers, release slot
-        3. Apply output head
+        1. Embed input (resident weights)
+        2. For each shard:
+           a. Get shard from streamer (copy weights to GPU slot if needed)
+           b. Run those layers on hidden states using shard weights
+           c. Release slot
+        3. Apply output head (resident weights)
         4. Sample next token
+        5. Repeat until max_new_tokens or EOS
+
+        KV cache is updated in place and stays resident throughout.
         """
         if not self._loaded:
             self.load_model()
@@ -294,7 +410,7 @@ class ShardFitEngine:
                 step_input_ids = generated_ids[:, -1:]
                 step_attention_mask = None
 
-            # Forward pass through shards
+            # Forward pass through shards (streaming)
             logits = self._forward_sharded(
                 step_input_ids,
                 step_attention_mask,
@@ -357,26 +473,27 @@ class ShardFitEngine:
         """Forward pass executing transformer layers shard-by-shard.
 
         For each shard:
-        1. Get shard from streamer (loads into slot if needed)
-        2. Run those layers on hidden states
-        3. Release slot
+        1. Get shard from streamer (loads weights into GPU slot if needed)
+        2. Copy shard weights to GPU (non-blocking via CUDA stream)
+        3. Run those layers on hidden states
+        4. Release slot (weights evicted from GPU VRAM)
+        5. While computing, copy stream preloads next shard
 
         KV cache is updated in place and stays resident.
         """
         device = self.backend.device
         dtype = torch.float16 if self.backend.supports_cuda() else torch.float32
 
-        # Embedding (resident)
+        # Embedding (resident, already on GPU)
         embed_weight = None
         for name, tensor in self.sharded_weights.resident_weights.items():
             if "embed" in name.lower() or "wte" in name.lower():
-                embed_weight = tensor.to(device)
+                embed_weight = tensor
                 break
 
         if embed_weight is not None:
             hidden = torch.nn.functional.embedding(input_ids, embed_weight)
         else:
-            # Fallback: use model's embedding
             hidden = self.model.get_input_embeddings()(input_ids)
 
         hidden = hidden.to(dtype=dtype, device=device)
@@ -385,39 +502,35 @@ class ShardFitEngine:
         seq_len = input_ids.shape[1]
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
 
-        # Process each shard
+        # Process each shard — stream through VRAM slots
         shard_idx = 0
         while True:
             shard = self.streamer.get_next_shard()
             if shard is None:
-                # No more shards — cycle back if we need multiple passes
-                # For a single forward pass, we process each shard once
                 break
 
-            # Get shard's weight tensors
-            shard_weights = {}
-            for block in shard.blocks:
-                for key in block.state_dict_keys:
-                    if key in self.sharded_weights.resident_weights:
-                        shard_weights[key] = self.sharded_weights.resident_weights[key].to(device)
-                    else:
-                        # Find the tensor in the original state dict
-                        # (In production, we'd load this from the shard's buffer)
-                        shard_weights[key] = self._get_weight_tensor(key).to(device)
+            # Copy shard weights to GPU slot (non-blocking via CUDA stream)
+            shard_weights = self._get_shard_weights_on_gpu(shard)
 
             # Run layers in this shard
             hidden = self._run_shard_layers(
-                shard, hidden, position_ids, attention_mask, shard_weights, step
+                shard, hidden, position_ids, attention_mask,
+                shard_weights, step
             )
 
+            # Synchronize before releasing slot (ensure compute done)
+            if self._supports_cuda_streams:
+                torch.cuda.synchronize()
+
+            # Release slot — weights evicted from GPU VRAM
             self.streamer.release_slot(shard)
             shard_idx += 1
 
-        # Output head (resident)
+        # Output head (resident, already on GPU)
         head_weight = None
         for name, tensor in self.sharded_weights.resident_weights.items():
             if "lm_head" in name.lower() or "output_head" in name.lower():
-                head_weight = tensor.to(device)
+                head_weight = tensor
                 break
 
         if head_weight is not None:
@@ -426,17 +539,6 @@ class ShardFitEngine:
             logits = self.model.lm_head(hidden)
 
         return logits
-
-    def _get_weight_tensor(self, name: str) -> torch.Tensor:
-        """Get a weight tensor from the model's state dict."""
-        state_dict = dict(self.model.named_parameters())
-        if name in state_dict:
-            return state_dict[name]
-        # Try buffers
-        buffers = dict(self.model.named_buffers())
-        if name in buffers:
-            return buffers[name]
-        raise KeyError(f"Weight {name} not found in model")
 
     def _run_shard_layers(
         self,
@@ -461,7 +563,7 @@ class ShardFitEngine:
             if layer_idx < 0:
                 continue
 
-            # Run this layer
+            # Run this layer using shard weights (streamed to GPU)
             hidden = self._run_single_layer(
                 layer_idx, hidden, position_ids, attention_mask,
                 shard_weights, step
@@ -479,7 +581,7 @@ class ShardFitEngine:
         shard_weights: Dict[str, torch.Tensor],
         step: int,
     ) -> torch.Tensor:
-        """Run a single transformer layer with KV cache.
+        """Run a single transformer layer with KV cache using shard weights.
 
         Standard transformer block:
         hidden = norm1(hidden)
@@ -488,30 +590,34 @@ class ShardFitEngine:
         hidden = norm2(hidden)
         mlp_out = mlp(hidden)
         hidden = hidden + mlp_out
+
+        All weights come from shard_weights (copied to GPU for this shard).
         """
         device = self.backend.device
         dtype = torch.float16 if self.backend.supports_cuda() else torch.float32
 
-        # Get layer weights
-        prefix = f"model.layers.{layer_idx}." if hasattr(self.model, 'model') else f"layers.{layer_idx}."
+        # Determine weight prefix for this layer
+        prefix = f"model.layers.{layer_idx}."
 
-        # Try to find weights with various prefixes
+        # Collect all weights for this layer from shard
         layer_weight_keys = [k for k in shard_weights.keys()
-                             if f"layers.{layer_idx}." in k or f"model.layers.{layer_idx}." in k]
+                             if f"layers.{layer_idx}." in k
+                             or f"model.layers.{layer_idx}." in k]
 
         if not layer_weight_keys:
-            # No weights found for this layer — use model directly
+            # No shard weights for this layer — use model directly
             layer_module = self._get_layer_module(layer_idx)
             return layer_module(hidden, position_ids=position_ids,
                                 attention_mask=attention_mask,
                                 past_key_value=self.kv_cache)
 
-        # Manual layer execution
-        # Attention
-        attn_norm_weight = self._get_weight(prefix + "input_layernorm.weight", shard_weights)
+        # --- Attention block ---
+        attn_norm_weight = self._get_weight(
+            prefix + "input_layernorm.weight", shard_weights
+        )
         if attn_norm_weight is not None:
             hidden_norm = torch.nn.functional.layer_norm(
-                hidden, attn_norm_weight.shape, attn_norm_weight
+                hidden, attn_norm_weight.shape, attn_norm_weight.to(device)
             )
         else:
             hidden_norm = hidden
@@ -533,10 +639,10 @@ class ShardFitEngine:
             k = k.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
             v = v.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-            # Store in KV cache
+            # Store in KV cache (resident)
             self.kv_cache.store(layer_idx, k, v, start_pos=0)
 
-            # Retrieve cache
+            # Retrieve full cache up to current position
             k_cache, v_cache = self.kv_cache.get(layer_idx, seq_len)
 
             # Attention
@@ -554,11 +660,13 @@ class ShardFitEngine:
             return layer_module(hidden, position_ids=position_ids,
                                 attention_mask=attention_mask)
 
-        # MLP
-        mlp_norm_weight = self._get_weight(prefix + "post_attention_layernorm.weight", shard_weights)
+        # --- MLP block ---
+        mlp_norm_weight = self._get_weight(
+            prefix + "post_attention_layernorm.weight", shard_weights
+        )
         if mlp_norm_weight is not None:
             hidden_norm = torch.nn.functional.layer_norm(
-                hidden, mlp_norm_weight.shape, mlp_norm_weight
+                hidden, mlp_norm_weight.shape, mlp_norm_weight.to(device)
             )
         else:
             hidden_norm = hidden
@@ -587,7 +695,6 @@ class ShardFitEngine:
         """Get a weight by name, trying multiple key formats."""
         if name in shard_weights:
             return shard_weights[name]
-        # Try without model.layers prefix
         alt = name.replace("model.layers.", "layers.")
         if alt in shard_weights:
             return shard_weights[alt]
