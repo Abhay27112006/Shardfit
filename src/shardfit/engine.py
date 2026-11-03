@@ -122,6 +122,7 @@ class ShardFitEngine:
         self.num_heads = 0
         self.head_dim = 0
         self.vocab_size = 0
+        self.max_context_len = max_context_len
 
         self._loaded = False
 
@@ -156,13 +157,19 @@ class ShardFitEngine:
             low_cpu_mem_usage=True,
         )
         self.model.eval()
+        self.model.to(self.backend.device)
 
         # Discover architecture
         self._discover_architecture()
 
-        # Load weights into sharded format
+        # Load weights into sharded format from the already-loaded model
         loader = WeightLoader(self.model_path, dtype=dtype, device="cpu")
-        self.sharded_weights = loader.load(slot_size_gb=self.budget.slot_size_gb)
+        state_dict = {k: v.to(dtype=dtype, device="cpu")
+                      for k, v in self.model.state_dict().items()}
+        self.sharded_weights = loader._organize_into_shards(
+            state_dict, slot_size_gb=self.budget.slot_size_gb
+        )
+        self.sharded_weights.source_format = "transformers"
 
         # Initialize KV cache
         self.kv_cache = KVCache(
@@ -170,7 +177,7 @@ class ShardFitEngine:
                 num_layers=self.num_layers,
                 num_heads=self.num_heads,
                 head_dim=self.head_dim,
-                max_context_len=max_context_len,
+                max_context_len=self.max_context_len,
                 dtype=dtype,
                 device=str(self.backend.device),
             )
@@ -265,6 +272,9 @@ class ShardFitEngine:
         attention_mask = inputs.get("attention_mask")
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.backend.device)
+            # SDPA requires float/bool mask, not int64
+            if attention_mask.dtype == torch.int64:
+                attention_mask = attention_mask.to(dtype=torch.float16)
 
         input_token_count = input_ids.shape[1]
         generated_ids = input_ids.clone()
@@ -599,12 +609,12 @@ class ShardFitEngine:
         config: GenerationConfig,
     ) -> torch.Tensor:
         """Sample next token with top-k and top-p."""
-        logits = logits.squeeze(0)
+        # logits shape: (batch, vocab_size)
 
         if config.do_sample and config.temperature > 0:
             # Top-k
             if config.top_k > 0 and config.top_k < logits.shape[-1]:
-                top_values, _ = torch.topk(logits, config.top_k)
+                top_values, _ = torch.topk(logits, config.top_k, dim=-1)
                 min_top_k = top_values[:, -1:]
                 logits = torch.where(
                     logits < min_top_k,
@@ -613,7 +623,7 @@ class ShardFitEngine:
                 )
 
             # Top-p
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             cumulative_probs = torch.cumsum(
                 torch.softmax(sorted_logits, dim=-1), dim=-1
             )

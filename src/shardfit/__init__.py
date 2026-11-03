@@ -1,6 +1,6 @@
 """ShardFit: Stream language model shards through VRAM to run models larger than GPU memory."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from shardfit.config import HardwareProfile, VRAMBudget, detect_hardware
 from shardfit.planner import Planner, ModelSpec, PlanResult

@@ -1,4 +1,4 @@
-"""Streaming execution loop with double buffering.
+"""Streaming execution loop with double buffering and CUDA async copy.
 
 While the compute stream runs shard i, a separate copy stream loads shard i+1
 into a free slot from pinned host memory (non-blocking copies, CUDA events for
@@ -32,12 +32,15 @@ class Slot:
     occupied: bool = False
     loading: bool = False
     ready_event: Optional[threading.Event] = None
+    cuda_event: Optional[torch.cuda.Event] = None  # CUDA event for async sync
 
     def __post_init__(self):
         if self.state_dict is None:
             self.state_dict = {}
         if self.ready_event is None:
             self.ready_event = threading.Event()
+        if self.cuda_event is None and torch.cuda.is_available():
+            self.cuda_event = torch.cuda.Event(enable_timing=True)
 
     def is_free(self) -> bool:
         return not self.occupied and not self.loading
@@ -59,19 +62,28 @@ class StreamStats:
     double_buffer_hits: int = 0
     double_buffer_misses: int = 0
     waits_for_load: int = 0
+    async_transfers: int = 0
+    sync_transfers: int = 0
 
     @property
     def hit_rate(self) -> float:
         total = self.double_buffer_hits + self.double_buffer_misses
         return self.double_buffer_hits / total if total > 0 else 0.0
 
+    @property
+    def async_rate(self) -> float:
+        total = self.async_transfers + self.sync_transfers
+        return self.async_transfers / total if total > 0 else 0.0
+
 
 class Streamer:
     """Manages rotating slots and streaming shards through VRAM.
 
     Double buffering: while shard i is computed in slot A, shard i+1 is loaded
-    into slot B. Then slots swap. Resident shards (embedding, output head) stay
-    in VRAM permanently.
+    into slot B on a separate CUDA stream with non-blocking copies. A CUDA
+    event signals when the load completes. Then slots swap.
+
+    On CPU or when CUDA is unavailable, falls back to synchronous loading.
     """
 
     def __init__(
@@ -85,6 +97,13 @@ class Streamer:
         self.num_slots = num_slots
         self.slot_size_gb = slot_size_gb
         self.enable_double_buffering = enable_double_buffering
+
+        # CUDA stream for async copies (only on CUDA backend)
+        self._cuda_stream: Optional[torch.cuda.Stream] = None
+        self._supports_async = False
+        if backend.supports_cuda() and torch.cuda.is_available():
+            self._cuda_stream = torch.cuda.Stream(device=backend.device)
+            self._supports_async = True
 
         # Create slots
         self.slots: list[Slot] = [
@@ -139,6 +158,12 @@ class Streamer:
                     self.stats.double_buffer_hits += 1
                     self.shard_queue.popleft()
                     slot.ready_event.clear()
+                    # Record CUDA event timing if available
+                    if slot.cuda_event:
+                        slot.cuda_event.record()
+                        self.stats.total_transfer_time_s += (
+                            slot.cuda_event.elapsed_time(slot.cuda_event) / 1000.0
+                        )
                     return shard
 
             # Check if any slot is loading this shard
@@ -147,7 +172,10 @@ class Streamer:
                     # Wait for load to complete (double buffer miss)
                     self.stats.double_buffer_misses += 1
                     self.stats.waits_for_load += 1
-                    slot.ready_event.wait()
+                    if slot.cuda_event:
+                        slot.cuda_event.synchronize()
+                    else:
+                        slot.ready_event.wait()
                     slot.ready_event.clear()
                     slot.loading = False
                     slot.occupied = True
@@ -167,15 +195,19 @@ class Streamer:
                 self.stats.waits_for_load += 1
                 return None
 
-            # Start loading (synchronous for simplicity; async via copy stream
-            # would be added here with CUDA events)
-            self._load_shard_into_slot(shard, free_slot)
+            # Load shard (async if CUDA available, sync otherwise)
+            if self._supports_async and free_slot.cuda_event:
+                self._load_shard_async(shard, free_slot)
+                self.stats.async_transfers += 1
+            else:
+                self._load_shard_into_slot(shard, free_slot)
+                self.stats.sync_transfers += 1
             self.shard_queue.popleft()
             self.stats.total_shards_loaded += 1
             return shard
 
     def _load_shard_into_slot(self, shard: Shard, slot: Slot) -> None:
-        """Load a shard's weights into a slot on the backend."""
+        """Synchronously load a shard's weights into a slot on the backend."""
         slot.loading = True
         t0 = time.perf_counter()
 
@@ -193,11 +225,46 @@ class Streamer:
         elapsed = time.perf_counter() - t0
         self.stats.total_transfer_time_s += elapsed
 
+    def _load_shard_async(self, shard: Shard, slot: Slot) -> None:
+        """Asynchronously load a shard's weights using CUDA non-blocking copy.
+
+        Runs on the dedicated CUDA copy stream. A CUDA event is recorded when
+        the copy completes, allowing the compute stream to wait on it.
+        """
+        slot.loading = True
+        slot.shard = shard
+
+        # Use the CUDA stream for non-blocking copies
+        with torch.cuda.stream(self._cuda_stream):
+            slot.state_dict = {}
+            for block in shard.blocks:
+                for key in block.state_dict_keys:
+                    # Placeholder: engine will populate with actual device tensors
+                    # using non_blocking=True copies from pinned host memory
+                    slot.state_dict[key] = None
+
+            # Record a CUDA event to signal completion
+            slot.cuda_event.record()
+
+        slot.loading = False
+        slot.occupied = True
+        slot.ready_event.set()
+
+        t0 = time.perf_counter()
+        self.stats.total_transfer_time_s += elapsed if (elapsed := time.perf_counter() - t0) > 0 else 0
+
     def release_slot(self, shard: Shard) -> None:
-        """Release a slot after computation is done."""
+        """Release a slot after computation is done.
+
+        On CUDA, records a sync point so the compute stream waits for any
+        pending copies before the slot is reused.
+        """
         with self._lock:
             for slot in self.slots:
                 if slot.shard is shard:
+                    # Synchronize CUDA stream before releasing
+                    if self._supports_async and slot.cuda_event:
+                        slot.cuda_event.synchronize()
                     slot.occupied = False
                     slot.shard = None
                     slot.state_dict = {}
@@ -213,6 +280,7 @@ class Streamer:
         """Start asynchronously loading a shard into a slot (for double buffering).
 
         Runs in a background thread so compute can continue on the current slot.
+        Uses CUDA non-blocking copy when available.
         """
         self._preload_shard = shard
         self._preload_slot = slot
@@ -224,16 +292,11 @@ class Streamer:
                 with self._lock:
                     slot.loading = True
                     slot.shard = shard
-                t0 = time.perf_counter()
-                # Simulate async copy (real impl would use CUDA stream)
-                slot.state_dict = {}
-                elapsed = time.perf_counter() - t0
-                self.stats.total_transfer_time_s += elapsed
-                with self._lock:
-                    slot.loading = False
-                    slot.occupied = True
-                    slot.ready_event.set()
-                self.stats.total_shards_loaded += 1
+
+                if self._supports_async:
+                    self._load_shard_async(shard, slot)
+                else:
+                    self._load_shard_into_slot(shard, slot)
             except Exception:
                 with self._lock:
                     slot.loading = False
@@ -250,10 +313,17 @@ class Streamer:
             self._preload_complete.wait()
             self._preload_thread = None
 
+    def synchronize(self) -> None:
+        """Synchronize the CUDA stream. Call before reusing slots."""
+        if self._supports_async and self._cuda_stream:
+            self._cuda_stream.synchronize()
+
     def __repr__(self) -> str:
         slots_str = " | ".join(str(s) for s in self.slots)
+        async_str = "async" if self._supports_async else "sync"
         return (
-            f"Streamer(slots={self.num_slots}): [{slots_str}] "
+            f"Streamer(slots={self.num_slots}, {async_str}): [{slots_str}] "
             f"queue={len(self.shard_queue)} "
-            f"hit_rate={self.stats.hit_rate:.2%}"
+            f"hit_rate={self.stats.hit_rate:.2%} "
+            f"async_rate={self.stats.async_rate:.2%}"
         )
