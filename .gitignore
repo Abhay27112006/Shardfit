@@ -1,0 +1,27 @@
+# Build artifacts
+baseline/llama.cpp/
+
+*.exe
+*.dll
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+
+# Downloaded models (large binary files)
+baseline/models/*.gguf
+
+# Benchmark results (kept - Phase 0 deliverable data)
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db

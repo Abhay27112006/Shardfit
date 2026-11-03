@@ -1,0 +1,4 @@
+model,num_gpu,context_len,repetitions,ttft_s,decode_tok_s,prefill_tok_s,vram_mb_after,tokens_generated
+gemma4:e4b,0,128,2,27.5949,10.078,109.276,48.0,128
+gemma4:e4b,0,512,2,15.2828,9.744,317.046,48.0,128
+gemma4:e4b,0,2048,2,19.2322,9.459,1894.989,48.0,128
