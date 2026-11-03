@@ -12,10 +12,15 @@ On top of the engine sits an **unattended agent runner**: hand it a task, it wor
 
 ## Project status
 
-- **Phase 0 (baseline):** Complete. Measured llama.cpp partial offload on RTX 3050 6GB laptop. CPU ≈ GPU for fitting models; GPU fails entirely for 14B models that don't fit in VRAM.
-- **Phase 1 (machine profiler):** In progress — this implementation.
-- **Phase 2 (planner):** Planned.
-- **Phase 3 (dense streamer):** Planned.
+| Phase | Name | Status |
+|-------|------|--------|
+| Phase 0 | Baseline | ✅ Complete — llama.cpp partial offload measured on RTX 3050 6GB |
+| Phase 1 | Machine profiler | ✅ Complete — host→GPU bandwidth, SSD read, free VRAM/RAM |
+| Phase 2 | Planner | ✅ Complete — speed prediction formulas (section 6), go/no-go |
+| Phase 3 | Dense streamer | ✅ Complete — real CUDA shard streaming through VRAM slots |
+| Phase 4 | MoE path | ✅ Complete — expert cache with LRU eviction, hit/miss tracking |
+| Phase 5 | Tokens per pass | ⬜ Planned — batching, speculative decoding |
+| Phase 6 | Agent runner | ⬜ Planned — unattended task loop with sandbox |
 
 See `ShardFit Vision and Engineering Brief.md` for the full specification.
 
@@ -23,29 +28,37 @@ See `ShardFit Vision and Engineering Brief.md` for the full specification.
 
 ```
 ShardFit/
-├── src/shardfit/           # Core engine (Python prototype)
-│   ├── config.py           # Hardware profile & VRAM budget
-│   ├── profiler.py         # Phase 1: machine profiler
-│   ├── planner.py          # Phase 2: speed planner (section 6 formulas)
-│   ├── sharder.py          # Model sharding (contiguous layer blocks)
+├── README.md                          # This file
+├── ShardFit Vision and Engineering Brief.md
+├── requirements.txt                   # Python dependencies
+├── setup.py                           # Package installation
+├── src/shardfit/                      # Core engine (Python prototype)
+│   ├── __init__.py
+│   ├── config.py                      # Hardware profile & VRAM budget
+│   ├── profiler.py                    # Phase 1: machine profiler
+│   ├── planner.py                     # Phase 2: speed planner (section 6)
+│   ├── sharder.py                     # Model sharding (contiguous layer blocks)
+│   ├── weights.py                     # Weight loading (safetensors, pytorch, GGUF)
+│   ├── kv_cache.py                    # KV cache resident in VRAM
+│   ├── moe.py                         # Phase 4: expert cache + MoE router
+│   ├── streamer.py                    # Phase 3: rotating VRAM slots + CUDA async
 │   ├── backends/
 │   │   ├── __init__.py
-│   │   ├── cuda.py         # CUDA backend (Windows + Linux)
-│   │   └── cpu.py          # CPU-only backend (Windows + Mac + Linux)
-│   ├── streamer.py         # Streaming execution loop (rotate slots)
-│   ├── engine.py           # Main engine: load → shard → stream → generate
-│   ├── agent.py            # Unattended agent runner (Phase 6 spec)
-│   └── __init__.py
-├── src/cli/                # Command-line interface
-│   └── chat.py             # Interactive chat CLI
-├── tests/                  # Unit tests
-├── build/                  # Platform build scripts
-│   ├── windows_cuda.bat    # Windows + CUDA build
-│   ├── windows_cpu.bat     # Windows CPU-only build
-│   └── mac.sh              # macOS build (Apple Silicon + Intel)
-├── requirements.txt        # Python dependencies
-├── setup.py                # Package installation
-└── ShardFit Vision and Engineering Brief.md
+│   │   ├── base.py                    # Abstract backend interface
+│   │   ├── cuda.py                    # CUDA backend (Windows + Linux)
+│   │   └── cpu.py                     # CPU-only backend (Windows + Mac + Linux)
+│   ├── engine.py                      # Main engine: load → shard → stream → generate
+│   ├── agent.py                       # Unattended agent runner (Phase 6 spec)
+│   └── cli/
+│       ├── __init__.py
+│       └── chat.py                    # Interactive chat CLI
+├── tests/                             # Unit tests
+│   └── test_core.py
+├── build/
+│   ├── windows_cuda.bat               # Windows + CUDA build
+│   ├── windows_cpu.bat                # Windows CPU-only build
+│   └── mac.sh                         # macOS build
+└── results/                           # Benchmark outputs
 ```
 
 ## Quick start
@@ -55,6 +68,7 @@ ShardFit/
 - Python 3.10+
 - PyTorch (CPU or CUDA variant)
 - For CUDA: NVIDIA CUDA toolkit + GPU drivers
+- For GGUF models: `pip install gguf`
 
 ### Install
 
@@ -88,17 +102,20 @@ python3 -m shardfit.profiler --output results/profile.json
 ### Run the planner (Phase 2)
 
 ```bash
-python -m shardfit.planner --model llama3.1-8b --gpu rtx3050 --context 2048
+python -m shardfit.planner --model llama-3.1-8b --size-gb 4.9 --gpu "RTX 3050" --context 2048
 ```
 
-### Run the CLI chat
+### Run the CLI chat (Phase 3)
 
 ```bash
-# CUDA backend (Windows)
+# CUDA backend (Windows with NVIDIA GPU)
 python -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cuda
 
 # CPU-only backend (Windows or Mac)
 python -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cpu
+
+# GGUF model (llama.cpp format)
+python -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M.gguf --backend cuda
 
 # Mac (Apple Silicon, unified memory)
 python3 -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cpu
@@ -107,15 +124,25 @@ python3 -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cpu
 ### Interactive chat example
 
 ```
-$ python -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cpu
-ShardFit CLI v0.1.0
-Backend: cpu | Model: llama-3.1-8b-Q4_K_M | VRAM budget: 4.5 GB
-Type your message (or 'quit' to exit)
+$ python -m shardfit.cli.chat --model models/llama-3.1-8b-Q4_K_M --backend cuda
+ShardFit CLI v0.3.0
+Run bigger models than your GPU can hold, unattended.
+
+Configuration:
+  Model: models/llama-3.1-8b-Q4_K_M
+  Backend: cuda
+  VRAM: 6.0 GB (reserve 1.5 GB)
+  Slots: 2 x 0.5 GB
+  Max tokens: 128
+  Temperature: 0.7
+
+Type your message (or 'quit' / 'exit' to quit)
 
 > What is ShardFit?
-Loading shard 0/5 into slot 0...
-Loading shard 1/5 into slot 1...
-Streaming pass 1/5...
+[ShardFit] Loading model from models/llama-3.1-8b-Q4_K_M...
+[ShardFit] Model loaded: 4.90 GB, 12 shards, KV cache 512.0 MB
+[ShardFit] Generating up to 128 tokens...
+[ShardFit] Generated 64 tokens in 2.1s (30.5 tok/s), TTFT=0.8s
 ShardFit is a runtime that runs language models larger than your GPU memory
 by streaming model shards through VRAM.
 >
@@ -125,10 +152,19 @@ by streaming model shards through VRAM.
 
 | Platform | Backend | Status |
 |----------|---------|--------|
-| Windows + NVIDIA GPU | CUDA | ✅ Supported |
+| Windows + NVIDIA GPU | CUDA | ✅ Supported (async streaming) |
 | Windows (no GPU) | CPU | ✅ Supported |
 | macOS Apple Silicon | CPU (unified memory) | ✅ Supported |
 | macOS Intel | CPU | ✅ Supported |
+
+## Supported model formats
+
+| Format | Extension | Status |
+|--------|-----------|--------|
+| HuggingFace (safetensors) | `.safetensors` | ✅ |
+| PyTorch | `.bin`, `.pt`, `.pth` | ✅ |
+| llama.cpp GGUF | `.gguf` | ✅ |
+| HF model directory | directory | ✅ |
 
 ## Design principles (from the brief)
 
@@ -138,11 +174,41 @@ by streaming model shards through VRAM.
 4. **Unattended must be safe:** Budgets, sandboxing, checkpoints, human review gate.
 5. **No layer skipping:** Every shard runs on every pass. Only approved approximation is quantization.
 
+## Architecture
+
+```
+Phase 3 Streaming (models larger than GPU VRAM):
+
+CPU RAM                          GPU VRAM (6 GB example)
+┌─────────────────┐              ┌─────────────────┐
+│ All model weights│              │ Resident: emb,  │
+│ (organized as    │              │ head, norms     │
+│  shards ~0.5 GB) │              │ (permanent)     │
+│ Shard 0          │ ──copy──▶   │ Slot A: shard i │
+│ Shard 1          │ ──copy──▶   │ Slot B: shard i+1│
+│ ...              │              │ KV cache        │
+│ Shard N          │              │ (resident)      │
+└─────────────────┘              └─────────────────┘
+                                   ▲ rotate ▲
+                                   └────────┘
+
+Only one shard (~0.5 GB) on GPU at a time.
+Non-blocking CUDA copy streams next shard while computing current.
+```
+
+## Performance measurements
+
+Measured on RTX 3050 6GB Laptop GPU + Core Ultra 7 155H, 16 GB RAM:
+
+| Model | Size | Fits VRAM? | CPU tok/s | GPU tok/s | Better |
+|-------|------|------------|-----------|-----------|--------|
+| gemma4:e4b | 8B Q4_K_M | Yes | ~10 | ~9.8 | Tie |
+| llama3.1:8b | 8B Q4_K_M | Yes | ~7 | ~6.9 | Tie |
+| qwen2.5:14b | 14B Q4_K_M | **No** | ~3.8 | **FAILED** | CPU only |
+
+**Key finding:** CPU ≈ GPU for models that fit; GPU fails entirely for models larger than VRAM. ShardFit's streaming solves the second case.
+
 ## Next phases
 
-- Phase 1: Machine profiler (real bandwidth measurements) — implemented here
-- Phase 2: Planner (speed prediction formulas) — implemented here
-- Phase 3: Dense streamer (rotating VRAM slots, copy stream)
-- Phase 4: MoE path (expert caching)
 - Phase 5: Tokens per pass (batching, speculative decoding)
-- Phase 6: Agent runner (unattended task loop)
+- Phase 6: Agent runner (unattended task loop with sandbox)
