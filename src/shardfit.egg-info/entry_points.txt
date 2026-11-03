@@ -1,0 +1,4 @@
+[console_scripts]
+shardfit-chat = shardfit.cli.chat:main
+shardfit-planner = shardfit.planner:main
+shardfit-profiler = shardfit.profiler:main

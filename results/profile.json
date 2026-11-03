@@ -1,0 +1,93 @@
+{
+  "platform": {
+    "os": "Windows",
+    "architecture": "AMD64",
+    "processor": "Intel64 Family 6 Model 170 Stepping 4, GenuineIntel"
+  },
+  "system_ram": {
+    "total_gb": 15.372058868408203,
+    "available_gb": 6.201038360595703,
+    "used_gb": 9.1710205078125,
+    "percent": 59.7
+  },
+  "cuda_available": true,
+  "host_to_gpu_bandwidth": {
+    "size_gb": 0.5,
+    "repetitions": 5,
+    "results": [
+      {
+        "repetition": 1,
+        "size_gb": 0.5,
+        "h2d_s": 0.07328980000238516,
+        "d2h_s": 0.2162441000000399,
+        "total_s": 0.28953390000242507,
+        "bandwidth_gb_s": 3.453826995704559
+      },
+      {
+        "repetition": 2,
+        "size_gb": 0.5,
+        "h2d_s": 0.06830919999993057,
+        "d2h_s": 0.04400849999728962,
+        "total_s": 0.11231769999722019,
+        "bandwidth_gb_s": 8.903316218412144
+      },
+      {
+        "repetition": 3,
+        "size_gb": 0.5,
+        "h2d_s": 0.04451849999895785,
+        "d2h_s": 0.04404680000152439,
+        "total_s": 0.08856530000048224,
+        "bandwidth_gb_s": 11.29110385212442
+      },
+      {
+        "repetition": 4,
+        "size_gb": 0.5,
+        "h2d_s": 0.04433940000308212,
+        "d2h_s": 0.04424060000019381,
+        "total_s": 0.08858000000327593,
+        "bandwidth_gb_s": 11.289230074091412
+      },
+      {
+        "repetition": 5,
+        "size_gb": 0.5,
+        "h2d_s": 0.04447499999878346,
+        "d2h_s": 0.04358910000155447,
+        "total_s": 0.08806410000033793,
+        "bandwidth_gb_s": 11.355365012487072
+      }
+    ],
+    "avg_bandwidth_gb_s": 9.258568430563923,
+    "min_bandwidth_gb_s": 3.453826995704559,
+    "max_bandwidth_gb_s": 11.355365012487072
+  },
+  "ssd_read_bandwidth": {
+    "size_gb": 1.0,
+    "repetitions": 3,
+    "results": [
+      {
+        "repetition": 1,
+        "size_gb": 1.0,
+        "elapsed_s": 0.742716400000063,
+        "bandwidth_gb_s": 1.3464089388626872
+      },
+      {
+        "repetition": 2,
+        "size_gb": 1.0,
+        "elapsed_s": 0.6451355999997759,
+        "bandwidth_gb_s": 1.5500617234583667
+      },
+      {
+        "repetition": 3,
+        "size_gb": 1.0,
+        "elapsed_s": 0.6766810999979498,
+        "bandwidth_gb_s": 1.4778009907518177
+      }
+    ],
+    "avg_bandwidth_gb_s": 1.4580905510242905,
+    "min_bandwidth_gb_s": 1.3464089388626872,
+    "max_bandwidth_gb_s": 1.5500617234583667
+  },
+  "free_vram_gb": 5.0322265625,
+  "gpu_name": "NVIDIA GeForce RTX 3050 6GB Laptop GPU",
+  "gpu_vram_total_gb": 5.99951171875
+}
