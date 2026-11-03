@@ -198,6 +198,159 @@ def test_streamer():
     print(f"PASS: test_streamer ({count} shards streamed)")
 
 
+def test_kv_cache():
+    """Test KV cache store and retrieve."""
+    from shardfit.kv_cache import KVCache, KVCacheConfig
+    import torch
+
+    config = KVCacheConfig(
+        num_layers=4,
+        num_heads=8,
+        head_dim=64,
+        max_context_len=128,
+        device="cpu",
+    )
+    cache = KVCache(config)
+
+    # Store keys/values for layer 0
+    batch, seq_len, heads, dim = 1, 16, 8, 64
+    keys = torch.randn(batch, seq_len, heads, dim)
+    values = torch.randn(batch, seq_len, heads, dim)
+
+    cache.store(0, keys, values, start_pos=0)
+
+    # Retrieve (batch dim is squeezed in store)
+    k_out, v_out = cache.get(0, seq_len)
+    assert k_out.shape == (seq_len, heads, dim)
+    assert v_out.shape == (seq_len, heads, dim)
+    assert cache.context_len == seq_len
+
+    # Store more at offset
+    keys2 = torch.randn(batch, 8, heads, dim)
+    values2 = torch.randn(batch, 8, heads, dim)
+    cache.store(0, keys2, values2, start_pos=seq_len)
+    assert cache.context_len == 24
+
+    print(f"PASS: test_kv_cache (memory={cache.get_memory_mb():.1f} MB, ctx={cache.context_len})")
+
+
+def test_moe_expert_cache():
+    """Test MoE expert cache hit/miss behavior."""
+    from shardfit.moe import ExpertCache, ExpertCacheConfig
+    import torch
+
+    config = ExpertCacheConfig(
+        num_experts=8,
+        experts_per_token=2,
+        expert_size_bytes=1024 * 1024,  # 1 MB per expert
+        max_cached_experts=3,
+        device="cpu",
+    )
+    cache = ExpertCache(config)
+
+    # Add experts to backing store
+    for i in range(8):
+        tensor = torch.randn(1024, 1024, dtype=torch.float16)
+        cache.add_expert_to_backing(i, tensor)
+
+    # First access = miss
+    t1 = cache.get_expert(0)
+    assert cache.stats.misses == 1
+    assert cache.stats.hits == 0
+
+    # Second access = hit
+    t2 = cache.get_expert(0)
+    assert cache.stats.misses == 1
+    assert cache.stats.hits == 1
+
+    # Access different experts to fill cache
+    cache.get_expert(1)
+    cache.get_expert(2)
+    assert len(cache.cached_experts) == 3
+
+    # Access expert 3 -> evicts LRU (expert 0, which was least recently used)
+    cache.get_expert(3)
+    assert len(cache.cached_experts) == 3
+    assert 0 not in cache.cached_experts  # evicted (LRU)
+    assert 3 in cache.cached_experts  # newly added
+
+    stats = cache.get_stats()
+    assert stats["hit_rate"] > 0
+    print(f"PASS: test_moe_expert_cache (hit_rate={stats['hit_rate']:.2%}, misses={stats['misses']})")
+
+
+def test_weights_loader():
+    """Test weight loader organization into shards."""
+    from shardfit.weights import WeightLoader
+    import torch
+    import tempfile
+    import os
+
+    # Create a tiny state dict (float16 to match loader dtype)
+    state_dict = {
+        "model.embed_tokens.weight": torch.randn(100, 16, dtype=torch.float16),
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.self_attn.v_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.self_attn.o_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.mlp.gate_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.mlp.down_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.0.mlp.up_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.self_attn.q_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.self_attn.k_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.self_attn.v_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.self_attn.o_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.mlp.gate_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.mlp.down_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.layers.1.mlp.up_proj.weight": torch.randn(16, 16, dtype=torch.float16),
+        "model.lm_head.weight": torch.randn(100, 16, dtype=torch.float16),
+        "model.norm.weight": torch.randn(16, dtype=torch.float16),
+    }
+
+    # Save to temp file
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, "test_shardfit_weights.safetensors")
+    from safetensors.torch import save_file as save_safetensors
+    # Ensure tensors are contiguous for safetensors
+    contiguous_sd = {k: v.contiguous() for k, v in state_dict.items()}
+    save_safetensors(contiguous_sd, temp_path)
+
+    try:
+        loader = WeightLoader(temp_path, dtype=torch.float16, device="cpu")
+        sharded = loader.load(slot_size_gb=0.001)  # Tiny slot to force sharding
+
+        assert sharded.total_size_gb > 0
+        assert len(sharded.shards) >= 1
+        assert len(sharded.resident_weights) > 0  # embed, norm, lm_head
+
+        # Verify all params accounted for
+        total_in_shards = sum(s.total_size_bytes for s in sharded.shards)
+        total_resident = sum(t.element_size() * t.numel() for t in sharded.resident_weights.values())
+        expected = sum(t.element_size() * t.numel() for t in state_dict.values())
+        assert total_in_shards + total_resident == expected
+
+        print(f"PASS: test_weights_loader ({len(sharded.shards)} shards, "
+              f"{len(sharded.resident_weights)} resident, {sharded.total_size_gb:.3f} GB)")
+    finally:
+        os.unlink(temp_path)
+
+
+def test_moe_router():
+    """Test MoE router expert selection."""
+    from shardfit.moe import MoERouter
+    import torch
+
+    router = MoERouter(num_experts=8, experts_per_token=2)
+    hidden = torch.randn(2, 4, 16)  # batch=2, seq=4, hidden=16
+
+    expert_indices, weights = router.route(hidden)
+
+    assert expert_indices.shape == (2, 4, 2)
+    assert weights.shape == (2, 4, 2)
+    assert expert_indices.max() < 8  # Valid expert IDs
+    print(f"PASS: test_moe_router (experts={expert_indices.shape})")
+
+
 def main():
     tests = [
         test_vram_budget,
@@ -208,6 +361,10 @@ def main():
         test_cpu_backend,
         test_create_backend_auto,
         test_streamer,
+        test_kv_cache,
+        test_moe_expert_cache,
+        test_weights_loader,
+        test_moe_router,
     ]
 
     passed = 0
