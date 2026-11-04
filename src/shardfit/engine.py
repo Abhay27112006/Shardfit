@@ -13,6 +13,7 @@ Architecture (section 5.3):
 
 from __future__ import annotations
 
+import os
 import time
 import threading
 from dataclasses import dataclass, field
@@ -188,8 +189,15 @@ class ShardFitEngine:
         # Load tokenizer (small, always in RAM)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
 
+        use_disk = self.use_disk_backed and os.path.exists(self.model_path)
+        if not use_disk and self.use_disk_backed:
+            print(f"[ShardFit] Model path is not a local file, "
+                  f"falling back to RAM-backed mode")
+            self.use_disk_backed = False
+
         if self.use_disk_backed:
-            # Disk-backed: scan metadata only, don't load tensor data
+            # Disk-backed: scan metadata only, don't load tensor data.
+            # CPU RAM usage stays bounded regardless of model size.
             self.disk_loader = DiskWeightLoader(
                 self.model_path, dtype=dtype, device="cpu"
             )
@@ -198,8 +206,6 @@ class ShardFitEngine:
             )
 
             # Discover architecture from manifest + model config
-            # We still need the model config for architecture info
-            # Use transformers just for config (not weights)
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(self.model_path)
             self.num_layers = getattr(config, "num_hidden_layers",
@@ -212,7 +218,6 @@ class ShardFitEngine:
             self.vocab_size = getattr(config, "vocab_size", 32000)
 
             # We still need a model instance for fallback forward passes
-            # Load with low_cpu_mem_usage and no weights
             self.model = AutoModelForCausalLM.from_config(config)
             self.model.eval()
             self.model.to(self.backend.device)
